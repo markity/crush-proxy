@@ -1,0 +1,21 @@
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/Makefile
+/build/
+
+# Go build artifacts
+/bin/
+/pkg/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# IDE/editor
+.vscode/
+*.swp
+*~
+.DS_Store
