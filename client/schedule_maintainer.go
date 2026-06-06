@@ -13,6 +13,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"golang.org/x/net/quic"
@@ -179,6 +180,8 @@ type Task struct {
 
 	// size = 1
 	TaskDone chan struct{}
+
+	finishOnce sync.Once
 }
 
 // stop被调用时, conn直接被破坏, conn会被自动关闭
@@ -188,6 +191,14 @@ func (task *Task) Stop(err error) {
 
 func (task *Task) GetFetcher() *TaskResultFetcher {
 	return task.TaskResultFetcher
+}
+
+func (task *Task) Fail(err error) {
+	task.CtxCancel(err)
+	task.finishOnce.Do(func() {
+		task.TaskResultFetcher.fail(err)
+		task.TaskDone <- struct{}{}
+	})
 }
 
 type ScheduleMaintainer struct {
@@ -309,6 +320,7 @@ func (maintainer *ScheduleMaintainer) RunForeverWithInitialCtx() {
 			case task := <-maintainer.PendingTasks:
 				taskStream, err := maintainer.CurrentControl.Conn.NewStream(context.Background())
 				if err != nil {
+					task.Fail(fmt.Errorf("new task stream failed: %w", err))
 					connClosed = true
 					connCloseReason = fmt.Errorf("new task stream failed: %w", err)
 					break
@@ -358,7 +370,9 @@ func HandleTask(task *Task, stream *quic.Stream) {
 	defer func() {
 		stream.Close()
 		controlCtxCancel(closeConnReason)
-		task.TaskDone <- struct{}{}
+		task.finishOnce.Do(func() {
+			task.TaskDone <- struct{}{}
+		})
 
 		DebugLogger.Println("task finished, and stream closed")
 	}()
@@ -438,14 +452,19 @@ func HandleTask(task *Task, stream *quic.Stream) {
 	go func() {
 		var errChan error
 		defer func() {
-			if errChan == nil {
-				DebugLogger.Printf("reader finished it's job")
-			}
-			readerExitChan <- errChan
-			close(readerExitChan)
 			task.Request.Body.Close()
 			close(task.TaskResultFetcher.HeaderChan)
 			close(task.TaskResultFetcher.BodyChan)
+			if errChan == nil {
+				DebugLogger.Printf("reader finished it's job")
+			} else {
+				select {
+				case task.TaskResultFetcher.ErrChan <- errChan:
+				default:
+				}
+			}
+			readerExitChan <- errChan
+			close(readerExitChan)
 		}()
 
 		conn := bufio.NewReader(stream)
@@ -455,8 +474,12 @@ func HandleTask(task *Task, stream *quic.Stream) {
 		if err != nil {
 			DebugLogger.Printf("handleTask, read response header failed: %v\n", err)
 			// 不会阻塞
-			task.TaskResultFetcher.HeaderChan <- nil
 			errChan = fmt.Errorf("failed to read response: %w", err)
+			select {
+			case task.TaskResultFetcher.ErrChan <- errChan:
+			default:
+			}
+			task.TaskResultFetcher.HeaderChan <- nil
 			return
 		}
 		DebugLogger.Printf("handleTask, got response: %v\n", resp.Status)
@@ -515,74 +538,107 @@ func HandleTask(task *Task, stream *quic.Stream) {
 }
 
 type TaskResultFetcher struct {
-	Ctx        context.Context
-	HeaderChan chan *http.Response
-	BodyChan   chan []byte
+	Ctx          context.Context
+	HeaderChan   chan *http.Response
+	BodyChan     chan []byte
+	ErrChan      chan error
+	headerMu     sync.Mutex
+	headerWaited bool
 }
 
-// return nil, nil
 func (fetcher *TaskResultFetcher) WaitHeader() (*http.Response, error) {
-	resp := <-fetcher.HeaderChan
+	fetcher.headerMu.Lock()
+	if fetcher.headerWaited {
+		fetcher.headerMu.Unlock()
+		return nil, errors.New("WaitHeader called more than once")
+	}
+	fetcher.headerWaited = true
+	fetcher.headerMu.Unlock()
+
+	resp, ok := <-fetcher.HeaderChan
+	if !ok {
+		if err := fetcher.err(); err != nil {
+			return nil, err
+		}
+		return nil, errors.New("header channel closed")
+	}
 	if resp == nil {
+		if err := fetcher.err(); err != nil {
+			return nil, err
+		}
 		return nil, errors.New("header not recognizable")
 	}
 	return resp, nil
 }
 
-// return nil, nil when finished
 func (fetcher *TaskResultFetcher) WaitNextBody() ([]byte, error) {
 	body, ok := <-fetcher.BodyChan
 	if !ok {
-		return nil, nil
+		if err := fetcher.err(); err != nil {
+			return nil, err
+		}
+		return nil, io.EOF
 	}
 	return body, nil
+}
+
+func (fetcher *TaskResultFetcher) fail(err error) {
+	select {
+	case fetcher.ErrChan <- err:
+	default:
+	}
+	select {
+	case fetcher.HeaderChan <- nil:
+	default:
+	}
+	close(fetcher.HeaderChan)
+	close(fetcher.BodyChan)
+}
+
+func (fetcher *TaskResultFetcher) err() error {
+	select {
+	case err := <-fetcher.ErrChan:
+		return err
+	default:
+		return nil
+	}
 }
 
 func MakeScheduleMatainer(control *ControlConnContext, taskInChanSize int) *ScheduleMaintainer {
 	return &ScheduleMaintainer{CurrentControl: control, PendingTasks: make(chan *Task, taskInChanSize)}
 }
 
-func (maintainer *ScheduleMaintainer) SubmitTask(req *http.Request, conn *net.TCPConn, connBufReader *bufio.Reader) *Task {
+func makeTask(req *http.Request, conn *net.TCPConn, connBufReader *bufio.Reader) *Task {
 	ctx, cancel := context.WithCancelCause(context.Background())
-
-	task := &Task{
+	return &Task{
 		Request:       req,
 		Conn:          conn,
 		ConnBufReader: connBufReader,
 		TaskResultFetcher: &TaskResultFetcher{
 			HeaderChan: make(chan *http.Response, 1),
 			BodyChan:   make(chan []byte),
+			ErrChan:    make(chan error, 1),
 			Ctx:        ctx,
 		},
 		Ctx:       ctx,
 		CtxCancel: cancel,
 		TaskDone:  make(chan struct{}, 1),
 	}
-	maintainer.PendingTasks <- task
-	return task
 }
 
-func (maintainer *ScheduleMaintainer) TrySubmitTask(req *http.Request, conn *net.TCPConn, connBufReader *bufio.Reader) (*Task, bool) {
-	ctx, cancel := context.WithCancelCause(context.Background())
-	task := &Task{
-		Request:       req,
-		Conn:          conn,
-		ConnBufReader: connBufReader,
-		TaskResultFetcher: &TaskResultFetcher{
-			HeaderChan: make(chan *http.Response, 1),
-			BodyChan:   make(chan []byte),
-			Ctx:        ctx,
-		},
-		Ctx:       ctx,
-		CtxCancel: cancel,
-		TaskDone:  make(chan struct{}, 1),
-	}
+func (maintainer *ScheduleMaintainer) SubmitTask(ctx context.Context, req *http.Request, conn *net.TCPConn, connBufReader *bufio.Reader) (*Task, error) {
+	task := makeTask(req, conn, connBufReader)
 
 	select {
 	case maintainer.PendingTasks <- task:
-		return task, true // 发送成功
+		return task, nil
+	case <-ctx.Done():
+		task.Fail(ctx.Err())
+		return nil, ctx.Err()
 	default:
-		return nil, false // channel 满了，立即返回
+		err := errors.New("task queue full")
+		task.Fail(err)
+		return nil, err
 	}
 }
 

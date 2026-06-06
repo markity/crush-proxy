@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
-	"sync"
 	"sync/atomic"
 
 	"crush-proxy/comm"
@@ -37,7 +39,12 @@ func HandleHttpProxyConn(conn *net.TCPConn, scheduler *ScheduleMaintainer) {
 		// TODO: 此处可以考虑实现客户端分流, 即为部分流量不走代理
 		DebugLogger.Printf("local server got a %v request, url: %v, submiting", req.Method, req.URL.String())
 
-		task := scheduler.SubmitTask(req, conn, br)
+		task, err := scheduler.SubmitTask(context.Background(), req, conn, br)
+		if err != nil {
+			DebugLogger.Printf("submit task failed: %v", err)
+			_, _ = conn.Write([]byte(comm.BadGatewayString))
+			break
+		}
 
 		shouldCloseForce := HandleSingleTaskResult(conn, task)
 		DebugLogger.Printf("a request task is handled and shoudCloseForce: %v", shouldCloseForce)
@@ -52,10 +59,6 @@ func HandleHttpProxyConn(conn *net.TCPConn, scheduler *ScheduleMaintainer) {
 		break
 	}
 }
-
-var Lock sync.Mutex
-var LastVal = -1
-var LastCnt = 0
 
 func HandleSingleTaskResult(browserConn *net.TCPConn, task *Task) (shouldForceClose bool) {
 	var stopCause error
@@ -107,13 +110,11 @@ func HandleSingleTaskResult(browserConn *net.TCPConn, task *Task) (shouldForceCl
 	for {
 		bodyFrame, err := fetcher.WaitNextBody()
 		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
 			stopCause = fmt.Errorf("get body data failed: %w", err)
 			return
-		}
-
-		// 返回nil, nil, 代表完成
-		if bodyFrame == nil {
-			break
 		}
 
 		n, err := browserConn.Write(bodyFrame)
@@ -122,17 +123,6 @@ func HandleSingleTaskResult(browserConn *net.TCPConn, task *Task) (shouldForceCl
 			return
 		}
 
-		Lock.Lock()
-		if n == LastVal {
-			LastCnt++
-		} else {
-			LastVal = n
-			LastCnt = 0
-		}
-		if LastVal == 0 && LastCnt >= 30 {
-			panic("123")
-		}
-		Lock.Unlock()
 		DebugLogger.Printf("write body data to browser: %v\n", n)
 	}
 
