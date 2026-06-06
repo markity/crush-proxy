@@ -13,9 +13,13 @@
 *.so
 *.dylib
 *.test
+*.pdf
 
 # IDE/editor
 .vscode/
 *.swp
 *~
 .DS_Store
+
+client/client
+server/server

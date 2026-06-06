@@ -161,16 +161,16 @@ func BuildRawResponseHeader(resp *http.Response) ([]byte, error) {
 
 	// 5. Content-Length
 	// resp.ContentLength >= 0 表示已知长度
-	if resp.ContentLength >= 0 {
-		fmt.Fprintf(&buf, "Content-Length: %d\r\n", resp.ContentLength)
-	}
+	// if resp.ContentLength >= 0 {
+	// 	fmt.Fprintf(&buf, "Content-Length: %d\r\n", resp.ContentLength)
+	// }
 
-	// 6. Transfer-Encoding，比如 chunked
-	for _, te := range resp.TransferEncoding {
-		if te != "" {
-			fmt.Fprintf(&buf, "Transfer-Encoding: %s\r\n", te)
-		}
-	}
+	// 6. Transfer-Encoding，比如 chunked或者[gzip, chunked]代表先gz再chunk
+	// for _, te := range resp.TransferEncoding {
+	// 	if te != "" {
+	// 		fmt.Fprintf(&buf, "Transfer-Encoding: %s\r\n", te)
+	// 	}
+	// }
 
 	// 7. Connection: close
 	if resp.Close {

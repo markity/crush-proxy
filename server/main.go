@@ -14,20 +14,37 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
+
+	_ "net/http/pprof"
 
 	"golang.org/x/net/quic"
 )
 
+func perf() {
+	http.ListenAndServe("localhost:6060", nil)
+}
+
 // crush-server-server ./server.conf
 func main() {
-	if len(os.Args) != 2 {
+	if len(os.Args) < 2 {
 		log.Fatalf("Usage: %s server.conf", os.Args[0])
 	}
 
 	LoadConfig(os.Args[1])
 
-	log.Printf("Server will listen on %s:%d", Config.ListenHost, Config.ListenPort)
+	if Config.Debug {
+		go func() {
+			for {
+				time.Sleep(time.Second)
+				DebugLogger.Printf("current stream cnt is %v\n", StreamCnt.Load())
+			}
+		}()
+		go perf()
+	}
+
+	DebugLogger.Printf("Server will listen on %s:%d", Config.ListenHost, Config.ListenPort)
 
 	cert, err := tls.LoadX509KeyPair(Config.Cert, Config.Key)
 	if err != nil {
@@ -53,7 +70,7 @@ func main() {
 	for {
 		conn, err := endpointServer.Accept(context.Background())
 		if err != nil {
-			log.Printf("failed to accept QUIC connection: %v", err)
+			DebugLogger.Printf("failed to accept QUIC connection: %v", err)
 			continue
 		}
 
@@ -62,12 +79,12 @@ func main() {
 }
 
 func heartbeatHandshake(ctx context.Context, conn *quic.Conn) (*quic.Stream, error) {
-	log.Println("doing accept stream")
+	DebugLogger.Println("doing accept stream")
 	mainStream, err := conn.AcceptStream(ctx)
 	if err != nil {
 		return nil, err
 	}
-	log.Println("main stream accepted")
+	DebugLogger.Println("main stream accepted")
 
 	mainStream.SetReadContext(ctx)
 	mainStream.SetWriteContext(ctx)
@@ -86,7 +103,7 @@ func heartbeatHandshake(ctx context.Context, conn *quic.Conn) (*quic.Stream, err
 			return
 		}
 
-		log.Println("handshake heartbeat recv")
+		DebugLogger.Println("handshake heartbeat recv")
 	}()
 	go func() {
 		var errChan error
@@ -98,7 +115,7 @@ func heartbeatHandshake(ctx context.Context, conn *quic.Conn) (*quic.Stream, err
 			errChan = fmt.Errorf("failed to send heartbeat: %w", err)
 		}
 		mainStream.Flush()
-		log.Println("handshake heartbeat sent")
+		DebugLogger.Println("handshake heartbeat sent")
 	}()
 
 	var err1 = <-done1
@@ -112,7 +129,7 @@ func heartbeatHandshake(ctx context.Context, conn *quic.Conn) (*quic.Stream, err
 	if err2 != nil {
 		return nil, fmt.Errorf("protocol error when handshake: %w", err2)
 	}
-	log.Println("send and recv all done")
+	DebugLogger.Println("send and recv all done")
 
 	mainStream.SetWriteContext(context.Background())
 	mainStream.SetReadContext(context.Background())
@@ -132,23 +149,23 @@ func heartbeatHandshake(ctx context.Context, conn *quic.Conn) (*quic.Stream, err
 		return nil, protocolHandshakeErr
 	}
 
-	log.Println("heartbeat is valid, main stream create success")
+	DebugLogger.Println("heartbeat is valid, main stream create success")
 
 	return mainStream, nil
 }
 
 func handleQUICConnection(conn *quic.Conn) {
-	log.Println("new conn")
+	DebugLogger.Println("new conn")
 	defer conn.Close()
 
-	handshakeCtx, heartbeatCancel := context.WithDeadline(context.Background(),
+	handshakeCtx, handshakeCancel := context.WithDeadline(context.Background(),
 		time.Now().Add(time.Millisecond*time.Duration(Config.HeartbeatTimeoutMs)))
 	mainStream, err := heartbeatHandshake(handshakeCtx, conn)
 	if err != nil {
-		heartbeatCancel()
+		handshakeCancel()
 		return
 	}
-	heartbeatCancel()
+	handshakeCancel()
 	fmt.Println("handshake ok")
 
 	// writer和reader will send error when exit
@@ -159,7 +176,7 @@ func handleQUICConnection(conn *quic.Conn) {
 	inChan := make(chan *packet.Packet, 512)
 	outChan := make(chan []byte, 512)
 
-	// 用来管理writer和reader, 以及accepter
+	// 用来管理writer和reader, 以及accepter的生命周期, 简单来说它就是quic连接的生命周期
 	ctx, cancel := context.WithCancelCause(context.Background())
 	mainStream.SetReadContext(ctx)
 	mainStream.SetWriteContext(ctx)
@@ -233,7 +250,8 @@ func handleQUICConnection(conn *quic.Conn) {
 			}
 
 			// 处理单条stream
-			log.Printf("go handleSingleStream")
+			DebugLogger.Printf("go handleSingleStream")
+			// stream属于quic连接, 所以也共享生命周期
 			go handleSingleStream(ctx, newStream)
 		}
 	}()
@@ -249,7 +267,6 @@ func handleQUICConnection(conn *quic.Conn) {
 		_, _ = <-writerExitChan
 		_, _ = <-readerExitChan
 		connClosed = true
-		conn.Close()
 	}
 
 	// 主要控制器
@@ -284,16 +301,30 @@ func handleQUICConnection(conn *quic.Conn) {
 	cleanResource(stopCause)
 }
 
+var StreamCnt atomic.Int64
+
 func handleSingleStream(ctx context.Context, stream *quic.Stream) {
-	log.Println("handle single stream")
-	defer stream.Close()
-	stream.SetReadContext(ctx)
-	stream.SetWriteContext(ctx)
+	DebugLogger.Println("handle single stream")
+	if Config.Debug {
+		StreamCnt.Add(1)
+		defer func() {
+			StreamCnt.Add(-1)
+		}()
+	}
+	defer func() {
+		stream.Close()
+	}()
+
+	controlCtx, controlCtxCancel := context.WithCancel(ctx)
+	defer controlCtxCancel()
+
+	stream.SetReadContext(controlCtx)
+	stream.SetWriteContext(controlCtx)
 
 	bufReader := bufio.NewReader(stream)
 	clientReq, err := http.ReadRequest(bufReader)
 	if err != nil {
-		log.Println(err)
+		DebugLogger.Println(err)
 		return
 	}
 	defer clientReq.Body.Close()
@@ -314,69 +345,92 @@ func handleSingleStream(ctx context.Context, stream *quic.Stream) {
 
 	if !isConnect {
 		targetURL := "http://" + clientReq.Host + clientReq.URL.RequestURI()
-		log.Printf("doing http request: %v %v\n", clientReq.Method, targetURL)
+		DebugLogger.Printf("doing http request: %v %v\n", clientReq.Method, targetURL)
 		targetRequest, err := http.NewRequest(clientReq.Method, targetURL, clientReq.Body)
 		if err != nil {
-			log.Println(err)
+			DebugLogger.Println(err)
 			return
 		}
 		for k, v := range clientReq.Header {
 			targetRequest.Header[k] = v
 		}
-		targetRequest = targetRequest.WithContext(ctx)
+
+		// read body, do request 都会被controlCtx控制
+		targetRequest = targetRequest.WithContext(controlCtx)
 
 		targetResponse, err := http.DefaultClient.Do(targetRequest)
 		if err != nil {
-			log.Println(err)
+			DebugLogger.Println(err)
 			return
 		}
 		defer targetResponse.Body.Close()
 		fmt.Printf("targetResponse header: %v\n", targetResponse.Header)
 
-		// responseBodyData, err := io.ReadAll(targetResponse.Body)
-		// if err != nil {
-		// 	fmt.Println(err)
-		// }
-		// fmt.Printf("readall response data: %v\n", string(responseBodyData))
-
 		responseHeaderBytes, err := comm.BuildRawResponseHeader(targetResponse)
 		if err != nil {
-			log.Println(err)
+			DebugLogger.Println(err)
 			return
 		}
 
-		log.Printf("response get, then writing header: %s\n", string(responseHeaderBytes))
-		_, err = stream.Write(responseHeaderBytes)
+		DebugLogger.Printf("response get, then writing header: %s\n", string(responseHeaderBytes))
+		if _, err := stream.Write(responseHeaderBytes); err != nil {
+			DebugLogger.Println(err)
+			return
+		}
 
-		log.Printf("response get, then writing body\n")
-		n, err := io.Copy(stream, targetResponse.Body)
-		fmt.Printf("write reponse length %v\n", n)
+		DebugLogger.Printf("response get, then writing body\n")
+
+		// 这里担心targetResponse.Body的读永久阻塞
+		n, err := io.Copy(comm.MakeFlushReaderWriter(stream), targetResponse.Body)
+		fmt.Printf("write response length %v, %v\n", n, err)
 	} else {
-		log.Println("it is a connect request")
+		DebugLogger.Println("it is a connect request")
 		remoteConn, err := net.Dial("tcp", clientReq.Host)
 		if err != nil {
-			log.Println(err)
+			DebugLogger.Println(err)
 			return
 		}
 		stream.Write([]byte(comm.EstablishedString))
 		stream.Flush()
 
-		log.Printf("dail %v ok, connected\n", clientReq.Host)
-
-		outChan1 := make(chan struct{}, 1)
-		outChan2 := make(chan struct{}, 1)
 		go func() {
-			io.Copy(comm.MakeFlushReaderWriter(stream), remoteConn)
-			outChan1 <- struct{}{}
+			<-controlCtx.Done()
+			remoteConn.Close()
+		}()
+
+		DebugLogger.Printf("dail %v ok, connected\n", clientReq.Host)
+
+		outChan1 := make(chan error, 1)
+		outChan2 := make(chan error, 1)
+		go func() {
+			_, err := io.Copy(comm.MakeFlushReaderWriter(stream), remoteConn)
+			stream.CloseWrite()
+			stream.Flush()
+			outChan1 <- err
 		}()
 
 		go func() {
-			io.Copy(remoteConn, stream)
-			outChan2 <- struct{}{}
+			_, err := io.Copy(remoteConn, stream)
+			outChan2 <- err
 		}()
 
-		<-outChan1
-		<-outChan2
-
+		select {
+		case err := <-outChan1:
+			if err != nil {
+				DebugLogger.Printf("handle single stream copy remote website to proxy stream err: %v", err)
+			}
+			controlCtxCancel()
+			remoteConn.Close()
+			stream.Close()
+			<-outChan2
+		case err := <-outChan2:
+			if err != nil {
+				DebugLogger.Printf("handle single stream copy proxy stream to remote website err: %v", err)
+			}
+			controlCtxCancel()
+			remoteConn.Close()
+			stream.Close()
+			<-outChan1
+		}
 	}
 }

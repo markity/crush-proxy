@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crush-proxy/comm"
 	"encoding/json"
 	"os"
 )
@@ -17,7 +18,11 @@ var Config struct {
 
 	RemoteHost string `json:"remote_host"`
 	RemotePort int    `json:"remote_port"`
+
+	Debug bool `json:"debug"`
 }
+
+var DebugLogger *comm.DebugeLogger
 
 func LoadConfig(path string) error {
 	config, err := os.ReadFile(path)
@@ -28,6 +33,8 @@ func LoadConfig(path string) error {
 	if err := json.Unmarshal(config, &Config); err != nil {
 		return err
 	}
+
+	DebugLogger = comm.NewDebugeLogger(Config.Debug)
 
 	return nil
 }
