@@ -166,7 +166,7 @@ func handleQUICConnection(conn *quic.Conn) {
 		return
 	}
 	handshakeCancel()
-	fmt.Println("handshake ok")
+	DebugLogger.Println("handshake ok")
 
 	// writer和reader will send error when exit
 	writerExitChan := make(chan error, 1)
@@ -321,18 +321,18 @@ func handleSingleStream(ctx context.Context, stream *quic.Stream) {
 	stream.SetReadContext(controlCtx)
 	stream.SetWriteContext(controlCtx)
 
-	bufReader := bufio.NewReader(stream)
-	clientReq, err := http.ReadRequest(bufReader)
+	clientBufReader := bufio.NewReader(stream)
+	clientReq, err := http.ReadRequest(clientBufReader)
 	if err != nil {
-		DebugLogger.Println(err)
+		DebugLogger.Printf("failed to parse client stream request: %v\n", err)
 		return
 	}
+	DebugLogger.Printf("request url: %v, method: %v", clientReq.URL.String(), clientReq.Method)
 	defer clientReq.Body.Close()
 
 	// TODO: 这里可以做一些安全策略，检查url
 
 	isConnect := false
-
 	switch clientReq.Method {
 	case http.MethodGet, http.MethodPut, http.MethodDelete, http.MethodPost,
 		http.MethodHead, http.MethodOptions, http.MethodPatch:
@@ -343,94 +343,79 @@ func handleSingleStream(ctx context.Context, stream *quic.Stream) {
 		return
 	}
 
+	remoteAddr, err := net.ResolveTCPAddr("tcp", comm.HostPortForRequest(clientReq))
+	if err != nil {
+		DebugLogger.Println(err)
+		return
+	}
+	remoteConn, err := net.DialTCP("tcp", nil, remoteAddr)
+	if err != nil {
+		DebugLogger.Println(err)
+		stream.Write([]byte(comm.BadGatewayString))
+		return
+	}
+	defer remoteConn.Close()
+	go func() {
+		<-controlCtx.Done()
+		remoteConn.Close()
+	}()
+
 	if !isConnect {
-		targetURL := "http://" + clientReq.Host + clientReq.URL.RequestURI()
-		DebugLogger.Printf("doing http request: %v %v\n", clientReq.Method, targetURL)
-		targetRequest, err := http.NewRequest(clientReq.Method, targetURL, clientReq.Body)
-		if err != nil {
-			DebugLogger.Println(err)
+		if err := clientReq.Write(remoteConn); err != nil {
+			DebugLogger.Printf("failed to write request to remote website: %v", err)
 			return
 		}
-		for k, v := range clientReq.Header {
-			targetRequest.Header[k] = v
-		}
-
-		// read body, do request 都会被controlCtx控制
-		targetRequest = targetRequest.WithContext(controlCtx)
-
-		targetResponse, err := http.DefaultClient.Do(targetRequest)
-		if err != nil {
-			DebugLogger.Println(err)
+		if err := remoteConn.CloseWrite(); err != nil {
+			DebugLogger.Printf("failed to close remote write side: %v", err)
 			return
 		}
-		defer targetResponse.Body.Close()
-		fmt.Printf("targetResponse header: %v\n", targetResponse.Header)
-
-		responseHeaderBytes, err := comm.BuildRawResponseHeader(targetResponse)
-		if err != nil {
-			DebugLogger.Println(err)
+		if _, err := io.Copy(comm.MakeFlushReaderWriter(stream), remoteConn); err != nil {
+			DebugLogger.Printf("handle single stream copy remote website to proxy stream err: %v", err)
 			return
 		}
-
-		DebugLogger.Printf("response get, then writing header: %s\n", string(responseHeaderBytes))
-		if _, err := stream.Write(responseHeaderBytes); err != nil {
-			DebugLogger.Println(err)
-			return
-		}
-
-		DebugLogger.Printf("response get, then writing body\n")
-
-		// 这里担心targetResponse.Body的读永久阻塞
-		n, err := io.Copy(comm.MakeFlushReaderWriter(stream), targetResponse.Body)
-		fmt.Printf("write response length %v, %v\n", n, err)
-	} else {
-		DebugLogger.Println("it is a connect request")
-		remoteConn, err := net.Dial("tcp", clientReq.Host)
-		if err != nil {
-			DebugLogger.Println(err)
-			return
-		}
-		stream.Write([]byte(comm.EstablishedString))
+		stream.CloseWrite()
 		stream.Flush()
+		return
+	}
 
-		go func() {
-			<-controlCtx.Done()
-			remoteConn.Close()
-		}()
+	if _, err := comm.MakeFlushReaderWriter(stream).Write([]byte(comm.EstablishedString)); err != nil {
+		DebugLogger.Println(err)
+		return
+	}
 
-		DebugLogger.Printf("dail %v ok, connected\n", clientReq.Host)
+	readerExitChan := make(chan error, 1)
+	writerExitChan := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(comm.MakeFlushReaderWriter(stream), remoteConn)
+		stream.CloseWrite()
+		stream.Flush()
+		readerExitChan <- err
+	}()
 
-		outChan1 := make(chan error, 1)
-		outChan2 := make(chan error, 1)
-		go func() {
-			_, err := io.Copy(comm.MakeFlushReaderWriter(stream), remoteConn)
-			stream.CloseWrite()
-			stream.Flush()
-			outChan1 <- err
-		}()
+	go func() {
+		_, err := io.Copy(remoteConn, clientBufReader)
+		remoteConn.CloseWrite()
+		writerExitChan <- err
+	}()
 
-		go func() {
-			_, err := io.Copy(remoteConn, stream)
-			outChan2 <- err
-		}()
-
-		select {
-		case err := <-outChan1:
-			if err != nil {
-				DebugLogger.Printf("handle single stream copy remote website to proxy stream err: %v", err)
-			}
+	select {
+	case err := <-readerExitChan:
+		if err != nil {
 			controlCtxCancel()
-			remoteConn.Close()
-			stream.Close()
-			<-outChan2
-		case err := <-outChan2:
-			if err != nil {
-				DebugLogger.Printf("handle single stream copy proxy stream to remote website err: %v", err)
-			}
-			controlCtxCancel()
-			remoteConn.Close()
-			stream.Close()
-			<-outChan1
+			DebugLogger.Printf("handle single stream copy remote website to proxy stream err: %v", err)
 		}
+		DebugLogger.Println("readerExitChan")
+		remoteConn.Close()
+		stream.Close()
+		<-writerExitChan
+	case err := <-writerExitChan:
+		if err != nil {
+			controlCtxCancel()
+			DebugLogger.Printf("handle single stream copy proxy stream to remote website err: %v", err)
+		}
+		DebugLogger.Println("writerExitChan")
+		remoteConn.Close()
+		stream.Close()
+		<-readerExitChan
 	}
 }

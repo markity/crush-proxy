@@ -13,7 +13,7 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/quic"
@@ -169,19 +169,14 @@ func MakeControlConnContext(ctx context.Context) (result *ControlConnContext, er
 }
 
 type Task struct {
-	Request           *http.Request
-	Conn              *net.TCPConn
-	ConnBufReader     *bufio.Reader
+	Conn          *net.TCPConn
+	ConnBufReader *bufio.Reader
+
 	TaskResultFetcher *TaskResultFetcher
 
 	// Task User 控制task
 	Ctx       context.Context
 	CtxCancel context.CancelCauseFunc
-
-	// size = 1
-	TaskDone chan struct{}
-
-	finishOnce sync.Once
 }
 
 // stop被调用时, conn直接被破坏, conn会被自动关闭
@@ -191,14 +186,6 @@ func (task *Task) Stop(err error) {
 
 func (task *Task) GetFetcher() *TaskResultFetcher {
 	return task.TaskResultFetcher
-}
-
-func (task *Task) Fail(err error) {
-	task.CtxCancel(err)
-	task.finishOnce.Do(func() {
-		task.TaskResultFetcher.fail(err)
-		task.TaskDone <- struct{}{}
-	})
 }
 
 type ScheduleMaintainer struct {
@@ -316,16 +303,18 @@ func (maintainer *ScheduleMaintainer) RunForeverWithInitialCtx() {
 				}
 			case _ = <-inChan:
 				tickLoss = 0
-			// TODO: 此处优化
 			case task := <-maintainer.PendingTasks:
-				taskStream, err := maintainer.CurrentControl.Conn.NewStream(context.Background())
-				if err != nil {
-					task.Fail(fmt.Errorf("new task stream failed: %w", err))
-					connClosed = true
-					connCloseReason = fmt.Errorf("new task stream failed: %w", err)
-					break
-				}
-				go HandleTask(task, taskStream)
+				// taskStream, err := maintainer.CurrentControl.Conn.NewStream(context.Background())
+				// if err != nil {
+				// 	task.TaskResultFetcher.ErrChan <- fmt.Errorf("new task stream failed: %w", err)
+				// 	close(task.TaskResultFetcher.ErrChan)
+				// 	connClosed = true
+				// 	connCloseReason = fmt.Errorf("new task stream failed: %w", err)
+				// 	break
+				// }
+				// go HandleTask(task, taskStream)
+				go HandleTask(task, maintainer.CurrentControl.Conn)
+
 			case err := <-writerExitChan:
 				connClosed = true
 				connCloseReason = fmt.Errorf("writer exit: %w", err)
@@ -343,7 +332,6 @@ func (maintainer *ScheduleMaintainer) RunForeverWithInitialCtx() {
 
 		var err error
 		for i := 0; i < Config.ReconnectMaxRetry; i++ {
-			fmt.Println(Config.ReconnectMaxRetry)
 			DebugLogger.Printf("connection lost, reconnecting %dst\n", i+1)
 			ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Duration(Config.ConnectTimeoutMs)*time.Millisecond))
 			maintainer.CurrentControl, err = MakeControlConnContext(ctx)
@@ -360,23 +348,22 @@ func (maintainer *ScheduleMaintainer) RunForeverWithInitialCtx() {
 	}
 }
 
-func HandleTask(task *Task, stream *quic.Stream) {
-	DebugLogger.Printf("handle task, task url: %v\n", task.Request.URL.String())
-
+func HandleTask(task *Task, quicConn *quic.Conn) {
 	// 用户调用Stop后, controlCloseConnCtx作为子context会被触发
 	//		此外 HandleTask出现错误，也会触发, 错误就是closeConnReason
 	var closeConnReason error
+	var req *http.Request
 	controlCloseConnCtx, controlCtxCancel := context.WithCancelCause(task.Ctx)
 	defer func() {
-		stream.Close()
 		controlCtxCancel(closeConnReason)
-		task.finishOnce.Do(func() {
-			task.TaskDone <- struct{}{}
-		})
-
+		task.TaskResultFetcher.ShouldClose.Store(true)
+		if req != nil && req.Header.Get("Proxy-Connection") == "keep-alive" {
+			task.TaskResultFetcher.ShouldClose.Store(false)
+		}
+		task.TaskResultFetcher.ErrChan <- closeConnReason
+		close(task.TaskResultFetcher.ErrChan)
 		DebugLogger.Println("task finished, and stream closed")
 	}()
-
 	// read browser conn, write to stream
 	// read stream, write to browser conn
 	// read/write tcp conn, even if ctx is triggered
@@ -386,10 +373,24 @@ func HandleTask(task *Task, stream *quic.Stream) {
 			task.Conn.Close()
 		}
 	}()
+
+	req, err := http.ReadRequest(task.ConnBufReader)
+	if err != nil {
+		closeConnReason = fmt.Errorf("failed to read http header from proxy stream: %v", err)
+		return
+	}
+	defer req.Body.Close()
+
+	stream, err := quicConn.NewStream(context.Background())
+	if err != nil {
+		closeConnReason = fmt.Errorf("new task stream failed: %w", err)
+		return
+	}
+	defer stream.Close()
+
+	DebugLogger.Printf("handle task, task url: %v\n", req.URL.String())
 	stream.SetReadContext(controlCloseConnCtx)
 	stream.SetWriteContext(controlCloseConnCtx)
-
-	req := task.Request
 
 	writerExitChan := make(chan error, 1)
 	readerExitChan := make(chan error, 1)
@@ -407,14 +408,6 @@ func HandleTask(task *Task, stream *quic.Stream) {
 			stream.Flush()
 		}()
 
-		// 构造消息头
-		// headerBs, err := comm.BuildRawRequestHeader(req)
-		// if err != nil {
-		// 	errChan = fmt.Errorf("build request header failed: %w", err)
-		// 	return
-		// }
-
-		// DebugLogger.Printf("write to proxy server: %v\n", string(headerBs))
 		DebugLogger.Printf("write req to proxy server\n")
 		err := req.Write(comm.MakeFlushReaderWriter(stream))
 		if err != nil {
@@ -432,14 +425,8 @@ func HandleTask(task *Task, stream *quic.Stream) {
 			return
 		}
 
-		// _, err = comm.MakeFlushReaderWriter(stream).Write(headerBs)
-		// if err != nil {
-		// 	errChan = err
-		// 	return
-		// }
-
 		// 不断读body, 直到body读到eof，假如body不完全或者tcp意外断开，会产生error
-		if task.Request.Method == http.MethodConnect {
+		if req.Method == http.MethodConnect {
 			// connect请求先丢弃req body, 再直接拷贝conn buf reader
 			n, err := io.Copy(comm.MakeFlushReaderWriter(stream), task.ConnBufReader)
 			DebugLogger.Printf("copy task conn buf to remote stream: %d %v\n", n, err)
@@ -452,67 +439,32 @@ func HandleTask(task *Task, stream *quic.Stream) {
 	go func() {
 		var errChan error
 		defer func() {
-			task.Request.Body.Close()
-			close(task.TaskResultFetcher.HeaderChan)
-			close(task.TaskResultFetcher.BodyChan)
-			if errChan == nil {
-				DebugLogger.Printf("reader finished it's job")
-			} else {
-				select {
-				case task.TaskResultFetcher.ErrChan <- errChan:
-				default:
-				}
-			}
+			req.Body.Close()
+
 			readerExitChan <- errChan
 			close(readerExitChan)
+
+			if errChan == nil {
+				DebugLogger.Printf("reader finished it's job")
+			}
 		}()
 
-		conn := bufio.NewReader(stream)
-		// 先找头
+		streamBufReader := bufio.NewReader(stream)
 		DebugLogger.Println("waiting for stream's http response header")
-		resp, err := http.ReadResponse(conn, req)
+		resp, err := http.ReadResponse(streamBufReader, req)
 		if err != nil {
 			DebugLogger.Printf("handleTask, read response header failed: %v\n", err)
 			// 不会阻塞
 			errChan = fmt.Errorf("failed to read response: %w", err)
-			select {
-			case task.TaskResultFetcher.ErrChan <- errChan:
-			default:
-			}
-			task.TaskResultFetcher.HeaderChan <- nil
 			return
 		}
-		DebugLogger.Printf("handleTask, got response: %v\n", resp.Status)
-
-		// 不会阻塞
-		task.TaskResultFetcher.HeaderChan <- resp
-
-		// 开始取body
-		cnt := 0
-		for {
-			buf := make([]byte, 4096)
-			n, err := resp.Body.Read(buf)
-			if err != nil && !errors.Is(err, io.EOF) {
-				log.Printf("read proxy response error: %v\n", err)
-				errChan = fmt.Errorf("failed to read response body: %w", err)
-				return
-			}
-			cnt += n
-
-			if n > 0 {
-				select {
-				case task.TaskResultFetcher.BodyChan <- buf[:n]:
-				case <-controlCloseConnCtx.Done():
-					errChan = context.Cause(controlCloseConnCtx)
-					return
-				}
-			}
-			if errors.Is(err, io.EOF) {
-
-				DebugLogger.Printf("stream between local and server read eof, total bytes %v\n", cnt)
-				errChan = nil
-				return
-			}
+		DebugLogger.Printf("HandleTask, got response from proxy server stream: %v\n", resp.Status)
+		resp.Write(task.Conn)
+		err = task.Conn.CloseWrite()
+		if err != nil {
+			log.Printf("failed to write response from stream to local browser conn: %v\n", err)
+			closeConnReason = err
+			return
 		}
 	}()
 
@@ -530,69 +482,29 @@ func HandleTask(task *Task, stream *quic.Stream) {
 			closeConnReason = fmt.Errorf("writer exit with err: %w", errWriter)
 			return
 		}
-		if task.Request.Method == http.MethodConnect {
-			controlCtxCancel(errors.New("connect tunnel writer closed"))
-		}
+		// if req.Method == http.MethodConnect {
+		// 	controlCtxCancel(errors.New("connect tunnel writer closed"))
+		// }
 		<-readerExitChan
 	}
+
+	DebugLogger.Println("HandleTask returned")
 }
 
 type TaskResultFetcher struct {
-	Ctx          context.Context
-	HeaderChan   chan *http.Response
-	BodyChan     chan []byte
-	ErrChan      chan error
-	headerMu     sync.Mutex
-	headerWaited bool
+	Ctx         context.Context
+	ErrChan     chan error
+	ShouldClose atomic.Bool
 }
 
-func (fetcher *TaskResultFetcher) WaitHeader() (*http.Response, error) {
-	fetcher.headerMu.Lock()
-	if fetcher.headerWaited {
-		fetcher.headerMu.Unlock()
-		return nil, errors.New("WaitHeader called more than once")
-	}
-	fetcher.headerWaited = true
-	fetcher.headerMu.Unlock()
-
-	resp, ok := <-fetcher.HeaderChan
+// bool notifies weather the conn is useful, if false, conn is closed
+func (fetcher *TaskResultFetcher) WaitProcess() (bool, error) {
+	err, ok := <-fetcher.ErrChan
 	if !ok {
-		if err := fetcher.err(); err != nil {
-			return nil, err
-		}
-		return nil, errors.New("header channel closed")
+		return false, errors.New("wait process can only be used once")
 	}
-	if resp == nil {
-		if err := fetcher.err(); err != nil {
-			return nil, err
-		}
-		return nil, errors.New("header not recognizable")
-	}
-	return resp, nil
-}
 
-func (fetcher *TaskResultFetcher) WaitNextBody() ([]byte, error) {
-	body, ok := <-fetcher.BodyChan
-	if !ok {
-		if err := fetcher.err(); err != nil {
-			return nil, err
-		}
-		return nil, io.EOF
-	}
-	return body, nil
-}
-
-func (fetcher *TaskResultFetcher) fail(err error) {
-	select {
-	case fetcher.ErrChan <- err:
-	default:
-	}
-	select {
-	case fetcher.HeaderChan <- nil:
-	default:
-	}
-	close(fetcher.HeaderChan)
-	close(fetcher.BodyChan)
+	return fetcher.ShouldClose.Load(), err
 }
 
 func (fetcher *TaskResultFetcher) err() error {
@@ -608,37 +520,30 @@ func MakeScheduleMatainer(control *ControlConnContext, taskInChanSize int) *Sche
 	return &ScheduleMaintainer{CurrentControl: control, PendingTasks: make(chan *Task, taskInChanSize)}
 }
 
-func makeTask(req *http.Request, conn *net.TCPConn, connBufReader *bufio.Reader) *Task {
+func makeTask(conn *net.TCPConn, connBufReader *bufio.Reader) *Task {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	return &Task{
-		Request:       req,
 		Conn:          conn,
 		ConnBufReader: connBufReader,
 		TaskResultFetcher: &TaskResultFetcher{
-			HeaderChan: make(chan *http.Response, 1),
-			BodyChan:   make(chan []byte),
-			ErrChan:    make(chan error, 1),
-			Ctx:        ctx,
+			ErrChan: make(chan error, 1),
+			Ctx:     ctx,
 		},
 		Ctx:       ctx,
 		CtxCancel: cancel,
-		TaskDone:  make(chan struct{}, 1),
 	}
 }
 
-func (maintainer *ScheduleMaintainer) SubmitTask(ctx context.Context, req *http.Request, conn *net.TCPConn, connBufReader *bufio.Reader) (*Task, error) {
-	task := makeTask(req, conn, connBufReader)
+func (maintainer *ScheduleMaintainer) SubmitTask(ctx context.Context, conn *net.TCPConn, br *bufio.Reader) (*Task, error) {
+	task := makeTask(conn, br)
 
 	select {
 	case maintainer.PendingTasks <- task:
 		return task, nil
 	case <-ctx.Done():
-		task.Fail(ctx.Err())
-		return nil, ctx.Err()
+		return nil, context.Canceled
 	default:
-		err := errors.New("task queue full")
-		task.Fail(err)
-		return nil, err
+		return nil, errors.New("task queue full")
 	}
 }
 

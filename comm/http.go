@@ -3,6 +3,7 @@ package comm
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 )
@@ -181,4 +182,21 @@ func BuildRawResponseHeader(resp *http.Response) ([]byte, error) {
 	buf.WriteString("\r\n")
 
 	return buf.Bytes(), nil
+}
+
+func HostPortForRequest(req *http.Request) string {
+	host := req.Host
+	if host == "" && req.URL != nil {
+		host = req.URL.Host
+	}
+
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return host
+	}
+
+	if req.Method == http.MethodConnect {
+		return net.JoinHostPort(host, "443")
+	}
+
+	return net.JoinHostPort(host, "80")
 }
